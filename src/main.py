@@ -43,15 +43,17 @@ sandbox_image = (
     .run_commands("npm install -g @anthropic-ai/claude-code")
     # Install uv (for OracleLoop tools)
     .run_commands("curl -LsSf https://astral.sh/uv/install.sh | sh")
-    .env({"PATH": "/root/.local/bin:$PATH"})
+    .env({"PATH": "/root/.local/bin:$PATH", "AGENT_VERSION": "2"})
     # Python dependencies
     .pip_install("claude-agent-sdk", "slack-sdk")
-    # Configure SSH for GitHub
+    # Configure SSH for GitHub + cache bust
     .run_commands(
         "mkdir -p /root/.ssh",
         "ssh-keyscan github.com >> /root/.ssh/known_hosts",
+        "echo 'agent-v2' > /root/.agent-version",
     )
-    # Add entrypoint script
+    # Add entrypoint script (with cache-busting comment to force rebuild)
+    # v2: logs to stderr, session status output
     .add_local_dir(AGENT_ENTRYPOINT, "/agent")
 )
 
@@ -116,26 +118,32 @@ def run_agent_turn(
     logger.info(f"[{sandbox_name}] Starting agent turn")
     process = sb.exec(*args)
 
-    # Stream stdout - log everything, yield non-log lines as responses
+    # Stream stdout - these are response lines for the user
     for line in process.stdout:
         line = line.strip()
-        if line.startswith("[LOG]"):
-            # Internal log line from agent - just log it
-            logger.info(f"[{sandbox_name}] {line}")
-        elif line:
-            # Response line - log and yield
+        if line:
             logger.info(f"[{sandbox_name}] Response: {line[:100]}...")
             yield {"response": line}
 
     exit_code = process.wait()
     logger.info(f"[{sandbox_name}] Agent exited with status {exit_code}")
 
-    # Capture and log stderr
+    # Stderr contains [LOG] messages and actual errors
     stderr = process.stderr.read()
     if stderr:
         for line in stderr.strip().split("\n"):
-            logger.error(f"[{sandbox_name}] STDERR: {line}")
-        yield {"response": f"*** ERROR ***\n{stderr}"}
+            if line.startswith("[LOG]"):
+                # Internal log message - just log it, don't show user
+                logger.info(f"[{sandbox_name}] {line}")
+            else:
+                # Actual error - log and show user only if exit was non-zero
+                logger.error(f"[{sandbox_name}] STDERR: {line}")
+        # Only show errors to user if process failed
+        if exit_code != 0:
+            # Filter out [LOG] lines from error output
+            error_lines = [l for l in stderr.strip().split("\n") if not l.startswith("[LOG]")]
+            if error_lines:
+                yield {"response": f"*** ERROR ***\n" + "\n".join(error_lines)}
 
 
 def post_status(client, channel: str, thread_ts: str, text: str, emoji: str = "⏳") -> None:
@@ -147,20 +155,50 @@ def post_status(client, channel: str, thread_ts: str, text: str, emoji: str = "�
     )
 
 
+def markdown_to_slack(text: str) -> str:
+    """Convert markdown to Slack mrkdwn format."""
+    # Convert **bold** to *bold*
+    text = re.sub(r"\*\*(.+?)\*\*", r"*\1*", text)
+    # Convert __bold__ to *bold*
+    text = re.sub(r"__(.+?)__", r"*\1*", text)
+    # Convert ## headers to *bold* (Slack doesn't have headers)
+    text = re.sub(r"^##+ +(.+)$", r"*\1*", text, flags=re.MULTILINE)
+    # Convert # headers to *bold*
+    text = re.sub(r"^# +(.+)$", r"*\1*", text, flags=re.MULTILINE)
+    # Convert [text](url) to <url|text>
+    text = re.sub(r"\[([^\]]+)\]\(([^)]+)\)", r"<\2|\1>", text)
+    return text
+
+
+# Track processed events to avoid duplicates
+_processed_events: set[str] = set()
+
+
 def process_message(body, client, user_message):
     """Process incoming Slack message and run agent."""
+    # Deduplicate: skip if we've already processed this event
+    event_id = body["event"].get("client_msg_id") or body["event"]["ts"]
+    if event_id in _processed_events:
+        logger.info(f"Skipping duplicate event: {event_id}")
+        return
+    _processed_events.add(event_id)
+    # Keep set bounded
+    if len(_processed_events) > 1000:
+        _processed_events.clear()
+
     channel = body["event"]["channel"]
     thread_ts = body["event"].get("thread_ts", body["event"]["ts"])
 
     sandbox_name = f"oracle-{body['team_id']}-{thread_ts}".replace(".", "-")
 
+    # Acquire sandbox first, then post status (avoids duplicate status messages)
+    is_new_session = False
     try:
         sb = modal.Sandbox.from_name(app_name=app.name, name=sandbox_name)
         logger.info(f"Reusing existing sandbox: {sandbox_name}")
-        post_status(client, channel, thread_ts, "Resuming session...", "🔄")
     except modal.exception.NotFoundError:
         logger.info(f"Creating new sandbox: {sandbox_name}")
-        post_status(client, channel, thread_ts, "Starting new session...", "🚀")
+        is_new_session = True
         try:
             sb = modal.Sandbox.create(
                 app=app,
@@ -180,6 +218,13 @@ def process_message(body, client, user_message):
             # Race condition: another request created it first, just use it
             logger.info(f"Sandbox created by concurrent request, reusing: {sandbox_name}")
             sb = modal.Sandbox.from_name(app_name=app.name, name=sandbox_name)
+            is_new_session = False  # Another request already posted status
+
+    # Post sandbox status AFTER acquired (avoids duplicate messages from race condition)
+    if is_new_session:
+        post_status(client, channel, thread_ts, "New sandbox", "🚀")
+    else:
+        post_status(client, channel, thread_ts, "Reusing sandbox", "🔄")
 
     # Always ensure SSH and repo are set up (idempotent operations)
     setup_github_ssh(sb)
@@ -191,7 +236,9 @@ def process_message(body, client, user_message):
 
     for result in run_agent_turn(sb, user_message, channel, thread_ts, sandbox_name):
         if result.get("response"):
-            client.chat_postMessage(channel=channel, text=result["response"], thread_ts=thread_ts)
+            # Convert markdown to Slack mrkdwn
+            slack_text = markdown_to_slack(result["response"])
+            client.chat_postMessage(channel=channel, text=slack_text, thread_ts=thread_ts)
 
 
 @app.function(

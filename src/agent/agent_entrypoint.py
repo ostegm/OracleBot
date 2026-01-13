@@ -15,8 +15,8 @@ SESSIONS_FILE = Path("/data/sessions.json")
 
 
 def log(msg: str) -> None:
-    """Print log message with prefix for main server to capture."""
-    print(f"[LOG] {msg}", flush=True)
+    """Print log message to stderr (not mixed with response output)."""
+    print(f"[LOG] {msg}", file=sys.stderr, flush=True)
 
 SYSTEM_PROMPT = """You are an assistant with full access to the OracleLoop codebase -
 a prediction market trading system for Kalshi.
@@ -74,6 +74,12 @@ async def main(user_msg: str, sandbox_name: str, sandbox_id: str, channel: str |
 
     session_id = load_session_id(sandbox_name)
     log(f"Loaded session_id={session_id}")
+
+    # Print session status for user (goes to stdout → Slack)
+    if session_id:
+        print("🔄 Resuming conversation", flush=True)
+    else:
+        print("✨ New conversation", flush=True)
 
     options = ClaudeAgentOptions(
         resume=session_id,
