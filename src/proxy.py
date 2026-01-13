@@ -13,7 +13,7 @@ app = modal.App("oracle-anthropic-proxy")
     secrets=[anthropic_secret],
     image=proxy_image,
     region="us-east-1",
-    container_idle_timeout=300,
+    scaledown_window=300,
 )
 @modal.concurrent(max_inputs=100)
 @modal.asgi_app()

@@ -133,7 +133,7 @@ def process_message(body, client, user_message):
 @app.function(
     secrets=[slack_secret],
     image=slack_bot_image,
-    container_idle_timeout=300,  # 5 min idle
+    scaledown_window=300,  # 5 min idle
 )
 @modal.concurrent(max_inputs=100)
 @modal.asgi_app()
