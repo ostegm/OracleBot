@@ -30,6 +30,8 @@ def anthropic_proxy():
         headers = {k: v for k, v in request.headers.items() if k.lower() not in ("host", "content-length")}
 
         sandbox_id = headers.get("x-api-key")
+        if not sandbox_id:
+            raise HTTPException(status_code=403, detail="Missing x-api-key header")
 
         try:
             sb = await modal.Sandbox.from_id.aio(sandbox_id)
