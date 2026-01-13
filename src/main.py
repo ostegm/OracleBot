@@ -16,6 +16,7 @@ app.include(proxy_app)
 
 slack_secret = modal.Secret.from_name("slack-bot-secret")  # SLACK_BOT_TOKEN, SLACK_SIGNING_SECRET
 github_deploy_key = modal.Secret.from_name("github-deploy-key")  # GITHUB_DEPLOY_KEY
+github_token = modal.Secret.from_name("github-token")  # GITHUB_TOKEN for gh CLI
 
 vol = modal.Volume.from_name("oracle-workspace", create_if_missing=True)
 
@@ -30,6 +31,13 @@ sandbox_image = (
     .run_commands(
         "curl -fsSL https://deb.nodesource.com/setup_20.x | bash -",
         "apt-get install -y nodejs",
+    )
+    # Install GitHub CLI
+    .run_commands(
+        "curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg",
+        "chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg",
+        'echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | tee /etc/apt/sources.list.d/github-cli.list > /dev/null',
+        "apt-get update && apt-get install -y gh",
     )
     # Install Claude CLI globally
     .run_commands("npm install -g @anthropic-ai/claude-code")
@@ -95,7 +103,8 @@ def run_agent_turn(
 ):
     """Execute one turn of Claude conversation in sandbox."""
     args = [
-        "python", "/agent/agent_entrypoint.py",
+        "python", "-u",  # Unbuffered output for real-time logging
+        "/agent/agent_entrypoint.py",
         "--message", user_message,
         "--sandbox-name", sandbox_name,
         "--sandbox-id", sb.object_id,
@@ -104,17 +113,38 @@ def run_agent_turn(
     if DEBUG_TOOL_USE:
         args.extend(["--channel", channel, "--thread-ts", thread_ts])
 
+    logger.info(f"[{sandbox_name}] Starting agent turn")
     process = sb.exec(*args)
 
+    # Stream stdout - log everything, yield non-log lines as responses
     for line in process.stdout:
-        yield {"response": line}
+        line = line.strip()
+        if line.startswith("[LOG]"):
+            # Internal log line from agent - just log it
+            logger.info(f"[{sandbox_name}] {line}")
+        elif line:
+            # Response line - log and yield
+            logger.info(f"[{sandbox_name}] Response: {line[:100]}...")
+            yield {"response": line}
 
     exit_code = process.wait()
-    logger.info(f"Agent process exited with status {exit_code}")
+    logger.info(f"[{sandbox_name}] Agent exited with status {exit_code}")
 
+    # Capture and log stderr
     stderr = process.stderr.read()
     if stderr:
+        for line in stderr.strip().split("\n"):
+            logger.error(f"[{sandbox_name}] STDERR: {line}")
         yield {"response": f"*** ERROR ***\n{stderr}"}
+
+
+def post_status(client, channel: str, thread_ts: str, text: str, emoji: str = "⏳") -> None:
+    """Post a status update to the Slack thread."""
+    client.chat_postMessage(
+        channel=channel,
+        thread_ts=thread_ts,
+        text=f"{emoji} {text}",
+    )
 
 
 def process_message(body, client, user_message):
@@ -127,22 +157,29 @@ def process_message(body, client, user_message):
     try:
         sb = modal.Sandbox.from_name(app_name=app.name, name=sandbox_name)
         logger.info(f"Reusing existing sandbox: {sandbox_name}")
+        post_status(client, channel, thread_ts, "Resuming session...", "🔄")
     except modal.exception.NotFoundError:
         logger.info(f"Creating new sandbox: {sandbox_name}")
-        sb = modal.Sandbox.create(
-            app=app,
-            image=sandbox_image,
-            secrets=[slack_secret, github_deploy_key] if DEBUG_TOOL_USE else [github_deploy_key],
-            volumes={VOL_MOUNT_PATH: vol},
-            workdir="/app",
-            env={
-                "CLAUDE_CONFIG_DIR": (VOL_MOUNT_PATH / "claude-config").as_posix(),
-                "ANTHROPIC_BASE_URL": anthropic_proxy.get_web_url(),
-            },
-            idle_timeout=5 * 60,  # 5 min idle
-            timeout=5 * 60 * 60,  # 5 hour max
-            name=sandbox_name,
-        )
+        post_status(client, channel, thread_ts, "Starting new session...", "🚀")
+        try:
+            sb = modal.Sandbox.create(
+                app=app,
+                image=sandbox_image,
+                secrets=[slack_secret, github_deploy_key, github_token] if DEBUG_TOOL_USE else [github_deploy_key, github_token],
+                volumes={VOL_MOUNT_PATH: vol},
+                workdir="/app",
+                env={
+                    "CLAUDE_CONFIG_DIR": (VOL_MOUNT_PATH / "claude-config").as_posix(),
+                    "ANTHROPIC_BASE_URL": anthropic_proxy.get_web_url(),
+                },
+                idle_timeout=5 * 60,  # 5 min idle
+                timeout=5 * 60 * 60,  # 5 hour max
+                name=sandbox_name,
+            )
+        except modal.exception.AlreadyExistsError:
+            # Race condition: another request created it first, just use it
+            logger.info(f"Sandbox created by concurrent request, reusing: {sandbox_name}")
+            sb = modal.Sandbox.from_name(app_name=app.name, name=sandbox_name)
 
     # Always ensure SSH and repo are set up (idempotent operations)
     setup_github_ssh(sb)
@@ -158,7 +195,7 @@ def process_message(body, client, user_message):
 
 
 @app.function(
-    secrets=[slack_secret, github_deploy_key],
+    secrets=[slack_secret, github_deploy_key, github_token],
     image=slack_bot_image,
     scaledown_window=300,  # 5 min idle
 )

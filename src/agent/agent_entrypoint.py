@@ -5,12 +5,18 @@ import argparse
 import asyncio
 import json
 import os
+import sys
 from pathlib import Path
 
 from claude_agent_sdk import ClaudeAgentOptions, ClaudeSDKClient, HookMatcher, ResultMessage
 from slack_tool_logger import SlackLogger
 
 SESSIONS_FILE = Path("/data/sessions.json")
+
+
+def log(msg: str) -> None:
+    """Print log message with prefix for main server to capture."""
+    print(f"[LOG] {msg}", flush=True)
 
 SYSTEM_PROMPT = """You are an assistant with full access to the OracleLoop codebase -
 a prediction market trading system for Kalshi.
@@ -19,6 +25,7 @@ Your working directory is /app/OracleLoop. You can:
 - Explore code with Read, Glob, Grep
 - Modify files with Write, Edit
 - Run OracleLoop tools: uv run python tools/<tool>.py <command>
+- Use GitHub CLI (gh) for GitHub operations
 
 Key tools available:
 - tools/market.py - Market data and event queries
@@ -26,7 +33,7 @@ Key tools available:
 - tools/trade.py - Trading operations (when enabled)
 - tools/analyze.py - Analysis utilities
 
-Changes stay in this sandbox session. You cannot push to GitHub yet.
+Changes stay in this sandbox session. Use `gh` CLI for GitHub operations like creating PRs.
 """
 
 
@@ -48,6 +55,9 @@ def save_session_id(sandbox_name: str, session_id: str) -> None:
 
 
 async def main(user_msg: str, sandbox_name: str, sandbox_id: str, channel: str | None, thread_ts: str | None):
+    log(f"Starting agent for sandbox={sandbox_name}")
+    log(f"User message: {user_msg[:100]}...")
+
     # Use the sandbox ID as the API key for the proxy. The proxy will exchange it
     # for the real key, as long as the sandbox is still running.
     os.environ["ANTHROPIC_API_KEY"] = sandbox_id
@@ -55,13 +65,15 @@ async def main(user_msg: str, sandbox_name: str, sandbox_id: str, channel: str |
     # Set up tool logging hooks if Slack channel info provided
     hooks = None
     if channel and thread_ts:
-        logger = SlackLogger(channel, thread_ts)
+        log(f"Setting up Slack tool logger for channel={channel}")
+        slack_logger = SlackLogger(channel, thread_ts)
         hooks = {
-            "PreToolUse": [HookMatcher(hooks=[logger.log_tool_use])],
-            "PostToolUse": [HookMatcher(hooks=[logger.log_tool_use])],
+            "PreToolUse": [HookMatcher(hooks=[slack_logger.log_tool_use])],
+            "PostToolUse": [HookMatcher(hooks=[slack_logger.log_tool_use])],
         }
 
     session_id = load_session_id(sandbox_name)
+    log(f"Loaded session_id={session_id}")
 
     options = ClaudeAgentOptions(
         resume=session_id,
@@ -73,18 +85,21 @@ async def main(user_msg: str, sandbox_name: str, sandbox_id: str, channel: str |
         hooks=hooks,
     )
 
+    log("Connecting to Claude SDK...")
     async with ClaudeSDKClient(options=options) as client:
         await client.query(user_msg)
+        log("Query sent, receiving response...")
 
         async for msg in client.receive_response():
             if isinstance(msg, ResultMessage):
+                log(f"Got ResultMessage, session_id={msg.session_id}")
                 save_session_id(sandbox_name, msg.session_id)
             elif hasattr(msg, "content"):
                 for block in msg.content:
                     if hasattr(block, "text"):
-                        print(block.text)
+                        print(block.text, flush=True)
 
-        print("Agent turn complete.")
+        log("Agent turn complete")
 
 
 if __name__ == "__main__":
