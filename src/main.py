@@ -1,8 +1,13 @@
+import logging
 import os
 import re
 from pathlib import Path
 
 import modal
+
+# Configure logging for Modal
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logger = logging.getLogger(__name__)
 
 from .proxy import anthropic_proxy, app as proxy_app
 
@@ -48,12 +53,17 @@ slack_bot_image = modal.Image.debian_slim(python_version="3.12").pip_install("sl
 def setup_github_ssh(sb: modal.Sandbox) -> None:
     """Write GitHub deploy key from environment to SSH config."""
     deploy_key = os.environ.get("GITHUB_DEPLOY_KEY", "")
+    logger.info(f"SSH key present: {bool(deploy_key)}, length: {len(deploy_key)}")
+
     if deploy_key:
         sb.exec(
             "bash",
             "-c",
             f'echo "{deploy_key}" > /root/.ssh/id_ed25519 && chmod 600 /root/.ssh/id_ed25519',
-        )
+        ).wait()
+        logger.info("SSH key written to sandbox")
+    else:
+        logger.warning("No SSH key found in environment!")
 
 
 def clone_or_update_repo(sb: modal.Sandbox) -> None:
@@ -61,20 +71,35 @@ def clone_or_update_repo(sb: modal.Sandbox) -> None:
     # Check if repo exists
     check = sb.exec("test", "-d", "/app/OracleLoop/.git")
     if check.wait() == 0:
-        # Repo exists, pull latest
-        sb.exec("bash", "-c", "cd /app/OracleLoop && git pull")
-    else:
-        # Clone fresh
-        sb.exec("git", "clone", "git@github.com:ostegm/OracleLoop.git", "/app/OracleLoop")
-        # Install dependencies
-        sb.exec("bash", "-c", "cd /app/OracleLoop && uv sync")
+        logger.info("Repo exists, pulling latest")
+        sb.exec("bash", "-c", "cd /app/OracleLoop && git pull").wait()
+        return
+
+    logger.info("Cloning OracleLoop repo...")
+    clone = sb.exec("git", "clone", "git@github.com:ostegm/OracleLoop.git", "/app/OracleLoop")
+    stdout_lines = list(clone.stdout)
+    exit_code = clone.wait()
+    stderr = clone.stderr.read()
+
+    if exit_code != 0:
+        logger.error(f"Clone FAILED (exit {exit_code}): {stderr}")
+        return
+
+    logger.info("Clone successful, installing dependencies...")
+    sb.exec("bash", "-c", "cd /app/OracleLoop && uv sync").wait()
+    logger.info("Dependencies installed")
 
 
 def run_agent_turn(
     sb: modal.Sandbox, user_message: str, channel: str, thread_ts: str, sandbox_name: str
 ):
     """Execute one turn of Claude conversation in sandbox."""
-    args = ["python", "/agent/agent_entrypoint.py", "--message", user_message, "--sandbox-name", sandbox_name]
+    args = [
+        "python", "/agent/agent_entrypoint.py",
+        "--message", user_message,
+        "--sandbox-name", sandbox_name,
+        "--sandbox-id", sb.object_id,
+    ]
 
     if DEBUG_TOOL_USE:
         args.extend(["--channel", channel, "--thread-ts", thread_ts])
@@ -85,7 +110,7 @@ def run_agent_turn(
         yield {"response": line}
 
     exit_code = process.wait()
-    print(f"Agent process exited with status {exit_code}")
+    logger.info(f"Agent process exited with status {exit_code}")
 
     stderr = process.stderr.read()
     if stderr:
@@ -101,7 +126,9 @@ def process_message(body, client, user_message):
 
     try:
         sb = modal.Sandbox.from_name(app_name=app.name, name=sandbox_name)
+        logger.info(f"Reusing existing sandbox: {sandbox_name}")
     except modal.exception.NotFoundError:
+        logger.info(f"Creating new sandbox: {sandbox_name}")
         sb = modal.Sandbox.create(
             app=app,
             image=sandbox_image,
@@ -116,14 +143,14 @@ def process_message(body, client, user_message):
             timeout=5 * 60 * 60,  # 5 hour max
             name=sandbox_name,
         )
-        # Set up GitHub SSH for private repo access
-        setup_github_ssh(sb)
-        # Clone/update OracleLoop
-        clone_or_update_repo(sb)
+
+    # Always ensure SSH and repo are set up (idempotent operations)
+    setup_github_ssh(sb)
+    clone_or_update_repo(sb)
 
     # Set up /data symlink for session persistence
     data_dir = (VOL_MOUNT_PATH / sandbox_name).as_posix()
-    sb.exec("bash", "-c", f"mkdir -p {data_dir} && ln -sf {data_dir} /data")
+    sb.exec("bash", "-c", f"mkdir -p {data_dir} && ln -sf {data_dir} /data").wait()
 
     for result in run_agent_turn(sb, user_message, channel, thread_ts, sandbox_name):
         if result.get("response"):
@@ -131,7 +158,7 @@ def process_message(body, client, user_message):
 
 
 @app.function(
-    secrets=[slack_secret],
+    secrets=[slack_secret, github_deploy_key],
     image=slack_bot_image,
     scaledown_window=300,  # 5 min idle
 )

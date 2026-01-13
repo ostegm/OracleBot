@@ -47,10 +47,10 @@ def save_session_id(sandbox_name: str, session_id: str) -> None:
     SESSIONS_FILE.write_text(json.dumps(sessions, indent=2))
 
 
-async def main(user_msg: str, sandbox_name: str, channel: str | None, thread_ts: str | None):
+async def main(user_msg: str, sandbox_name: str, sandbox_id: str, channel: str | None, thread_ts: str | None):
     # Use the sandbox ID as the API key for the proxy. The proxy will exchange it
     # for the real key, as long as the sandbox is still running.
-    os.environ["ANTHROPIC_API_KEY"] = os.environ.get("MODAL_SANDBOX_ID", "")
+    os.environ["ANTHROPIC_API_KEY"] = sandbox_id
 
     # Set up tool logging hooks if Slack channel info provided
     hooks = None
@@ -91,8 +91,9 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--message", type=str, required=True)
     parser.add_argument("--sandbox-name", type=str, required=True)
+    parser.add_argument("--sandbox-id", type=str, required=True)
     parser.add_argument("--channel", type=str, required=False)
     parser.add_argument("--thread-ts", type=str, required=False)
     args = parser.parse_args()
 
-    asyncio.run(main(args.message, args.sandbox_name, args.channel, args.thread_ts))
+    asyncio.run(main(args.message, args.sandbox_name, args.sandbox_id, args.channel, args.thread_ts))
